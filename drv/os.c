@@ -373,6 +373,12 @@ void OsCompleteIrp(PIRP irp, NTSTATUS st, ULONG info)
     irp->IoStatus.Status = st;
     irp->IoStatus.Information = info;
 #ifdef AUDIONT_WDM
+    {
+        PDEVICE_OBJECT dev = IoGetCurrentIrpStackLocation(irp)->DeviceObject;
+        DEV_EXT *ext = dev ? dev->DeviceExtension : NULL;
+        if (ext && ext->Magic == DEVEXT_MAGIC && ext->GeodeRundown)
+            IoReleaseRemoveLock(&ext->RemoveLock, irp);
+    }
     IoCompleteRequest(irp, IO_SOUND_INCREMENT);
 #else
     if (pIofCompleteRequest) pIofCompleteRequest(irp, IO_SOUND_INCREMENT);

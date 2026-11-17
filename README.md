@@ -18,6 +18,10 @@ Sound (audio DSP) and **USB Audio (UAC 1.0 / 2.0)**. It runs on Windows NT
 **Windows 2000 / XP (x86, x64)**. USB audio devices are driven through the
 [USBNT](https://github.com/ages2001/USBNT) USB stack.
 
+The Geode extension adds **CS5536 playback (working on Linutop 2 / XP SP3)**
+and a **CS5530 playback backend (tested but on a board without working audio outputs)**.
+Both target XP x86; see the [Geode status, build and installation notes](docs/geode.md).
+
 ## Contents
 
 - [Overview](#overview)

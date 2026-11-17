@@ -1,7 +1,7 @@
 /*
  * AUDIONT - audio engine
  *
- * The hardware always runs at 48 kHz, 16-bit stereo on a looping DMA ring.
+ * The hardware runs at its card EngineRate, 16-bit stereo on a looping DMA ring.
  * A periodic timer DPC (and the period interrupt, when one is connected)
  * reads the hardware position and renders mixed audio a fixed latency
  * ahead of it.  Any number of wave-out streams (up to MAX_PLAY_STREAMS)
@@ -23,6 +23,7 @@
 #define IDLE_STOP_MS    3000
 
 static VOID NTAPI CancelRoutine(PDEVICE_OBJECT dev, PIRP irp);
+static void PlayFlush(CARD *c, PLAY_STREAM *s, NTSTATUS st);
 
 /* ------------------------------------------------------------------ */
 /* locking and IRP bookkeeping                                         */
@@ -163,22 +164,26 @@ NTSTATUS EngineInit(CARD *c)
         InitializeListHead(&c->Play[ms].Done);
     }
     for (ms = 0; ms < MAX_REC_STREAMS; ms++) InitializeListHead(&c->Rec[ms].Queue);
-    if (!OsAllocDma(&c->PlayRing, RING_BYTES, c->DmaUncached)) return STATUS_INSUFFICIENT_RESOURCES;
-    if (!OsAllocDma(&c->RecRing, RING_BYTES, c->DmaUncached)) return STATUS_INSUFFICIENT_RESOURCES;
+    if (!c->EngineRate) c->EngineRate = ENG_RATE;
+    if (!c->BackendBuffers) {
+        if (!OsAllocDma(&c->PlayRing, RING_BYTES, c->DmaUncached)) return STATUS_INSUFFICIENT_RESOURCES;
+        if (!OsAllocDma(&c->RecRing, RING_BYTES, c->DmaUncached)) return STATUS_INSUFFICIENT_RESOURCES;
+    }
     KeInitializeDpc(&c->TimerDpc, TimerDpcRoutine, c);
     KeInitializeDpc(&c->IsrDpc, IsrDpcRoutine, c);
     KeInitializeTimer(&c->Timer);
-    ms = OsRegGetDword(L"LatencyMs", 60);
+    c->EngineReady = TRUE;
+    ms = OsRegGetDword(L"LatencyMs", c->Type == HW_CS5530 ? 100 : 60);
     if (ms < 20) ms = 20;
     if (ms > 150) ms = 150;
-    c->LatencyFrames = ms * (ENG_RATE / 1000);
+    c->LatencyFrames = (ULONG)(((ULONGLONG)ms * c->EngineRate) / 1000);
     /* LatencyMaxMs: a system whose DPCs come later than that (slow disks, other drivers,
        virtual machines) gets more by itself after underruns, up to that.  Off by default:
        buffers complete once they are heard, so a program with less sound queued than the
        latency would run dry all the time */
     ms = OsRegGetDword(L"LatencyMaxMs", 0);
     if (ms > 150) ms = 150;
-    c->LatencyMaxFrames = MAX(ms * (ENG_RATE / 1000), c->LatencyFrames);
+    c->LatencyMaxFrames = MAX((ULONG)(((ULONGLONG)ms * c->EngineRate) / 1000), c->LatencyFrames);
     c->DebugStallMs = MIN(OsRegGetDword(L"DebugStallMs", 0), 1000);
     /* EarlyComplete (1): a buffer is given back when it is heard - unless the program has
        nothing more queued: then at once when it is mixed.  Programs that keep less sound
@@ -187,8 +192,8 @@ NTSTATUS EngineInit(CARD *c)
        sent the next one, so the mixer ran dry in between and the sound was choppy. */
     c->EarlyComplete = OsRegGetDword(L"EarlyComplete", 1) ? TRUE : FALSE;
     LOGV("card%u: play ring va=%p pa=%08x, rec ring pa=%08x, latency %u ms (max %u)",
-         c->Index, c->PlayRing.Va, c->PlayRing.Pa, c->RecRing.Pa, c->LatencyFrames / (ENG_RATE / 1000),
-         c->LatencyMaxFrames / (ENG_RATE / 1000));
+         c->Index, c->PlayRing.Va, c->PlayRing.Pa, c->RecRing.Pa, (ULONG)(((ULONGLONG)c->LatencyFrames * 1000) / c->EngineRate),
+         (ULONG)(((ULONGLONG)c->LatencyMaxFrames * 1000) / c->EngineRate));
     return STATUS_SUCCESS;
 }
 
@@ -231,12 +236,17 @@ NTSTATUS EngineStart(CARD *c)
         }
     }
 #endif
+    if (c->RequireInterrupt && !c->UseInterrupt) {
+        LOGE("card%u: this backend requires its assigned interrupt", c->Index);
+        return STATUS_UNSUCCESSFUL;
+    }
     LOGI("card%u: %s mode (irq %u)", c->Index, c->UseInterrupt ? "interrupt" : "polling", c->Irq);
     return STATUS_SUCCESS;
 }
 
 void EngineShutdown(CARD *c)
 {
+    if (!c->EngineReady) return;
     EngineLock(c);
     c->Stopping = TRUE;
     if (c->Playing) { c->Ops->StopPlay(c); c->Playing = FALSE; }
@@ -246,6 +256,14 @@ void EngineShutdown(CARD *c)
     KeRemoveQueueDpc(&c->TimerDpc);
     if (c->Interrupt) { IoDisconnectInterrupt(c->Interrupt); c->Interrupt = NULL; }
     KeRemoveQueueDpc(&c->IsrDpc);
+#ifdef AUDIONT_WDM
+    if (c->Type == HW_CS5530 || c->Type == HW_CS5536) {
+        /* Geode init requires this XP export. Drain executing callbacks before free. */
+        void (NTAPI *flush)(void) = OsResolve(0, "KeFlushQueuedDpcs");
+        if (flush) flush();
+    }
+#endif
+    c->EngineReady = FALSE;
 }
 
 /* ------------------------------------------------------------------ */
@@ -443,7 +461,7 @@ static void PlayProcess(CARD *c, ULONG elapsedMs)
     } else {
         ULONG pos = c->Ops->PlayPos(c) % RING_FRAMES;
         ULONG delta = (pos + RING_FRAMES - c->LastPlayPos) % RING_FRAMES;
-        ULONG expect = elapsedMs * (ENG_RATE / 1000);
+        ULONG expect = (ULONG)(((ULONGLONG)elapsedMs * c->EngineRate) / 1000);
         if (delta >= RING_FRAMES - 2 * RING_PERIOD_FRAMES && delta > expect + RING_FRAMES / 4) {
             /* the position went back a little (a controller showing a stale value for a
                moment): that is not a lap of the ring, wait for it to move on */
@@ -452,7 +470,7 @@ static void PlayProcess(CARD *c, ULONG elapsedMs)
             expect = 0;
         }
         /* a DPC delayed by more than one ring length: account for the lost wraps */
-        while (expect > delta + RING_FRAMES / 2 + RING_FRAMES / 4 && expect < 60 * ENG_RATE) {
+        while (expect > delta + RING_FRAMES / 2 + RING_FRAMES / 4 && expect < 60 * c->EngineRate) {
             delta += RING_FRAMES;
             if (delta > expect) break;
         }
@@ -468,8 +486,8 @@ static void PlayProcess(CARD *c, ULONG elapsedMs)
             LOGV("card%u: underrun (played %u written %u, +%u frames in %u ms)", c->Index,
                  (ULONG)c->PlayedFrames, (ULONG)c->WrittenFrames, step, elapsedMs);
             if (c->LatencyFrames < c->LatencyMaxFrames) {
-                c->LatencyFrames = MIN(c->LatencyFrames + 20 * (ENG_RATE / 1000), c->LatencyMaxFrames);
-                LOGI("card%u: underrun, latency now %u ms", c->Index, c->LatencyFrames / (ENG_RATE / 1000));
+                c->LatencyFrames = MIN(c->LatencyFrames + c->EngineRate / 50, c->LatencyMaxFrames);
+                LOGI("card%u: underrun, latency now %u ms", c->Index, (ULONG)(((ULONGLONG)c->LatencyFrames * 1000) / c->EngineRate));
             }
         }
         c->WrittenFrames = c->PlayedFrames + 32;
@@ -499,7 +517,10 @@ void EngineKick(CARD *c)
         c->LastPlayPos = 0;
         RenderAhead(c);
         if (!c->Ops->StartPlay(c)) {
+            ULONG i;
             LOGE("card%u: StartPlay failed", c->Index);
+            for (i = 0; i < MAX_PLAY_STREAMS; i++)
+                if (c->Play[i].InUse) PlayFlush(c, &c->Play[i], STATUS_IO_DEVICE_ERROR);
             return;
         }
         c->LastPlayPos = c->Ops->PlayPos(c) % RING_FRAMES;
@@ -554,7 +575,7 @@ static void RecProcess(CARD *c, ULONG elapsedMs)
     ULONG delta = (pos + RING_FRAMES - c->LastRecPos) % RING_FRAMES;
     const SHORT *ring = c->RecRing.Va;
     if (c->Ops->RecTick) c->Ops->RecTick(c);
-    if (delta >= RING_FRAMES - 2 * RING_PERIOD_FRAMES && delta > elapsedMs * (ENG_RATE / 1000) + RING_FRAMES / 4)
+    if (delta >= RING_FRAMES - 2 * RING_PERIOD_FRAMES && delta > (ULONG)(((ULONGLONG)elapsedMs * c->EngineRate) / 1000) + RING_FRAMES / 4)
         pos = c->LastRecPos;                   /* went back a little: stale, not a lap */
     if (pos != c->LastRecPos) {
         if (pos > c->LastRecPos) {
@@ -675,7 +696,7 @@ NTSTATUS WaveOutIoctl(CARD *c, PIRP irp, PIO_STACK_LOCATION sp)
         } else {
             PlayFlush(c, s, STATUS_SUCCESS);
         }
-        ConvSetup(&s->Conv, &f, FALSE);
+        ConvSetupRate(&s->Conv, &f, FALSE, c->EngineRate);
         PlayResetPos(s);
         EngineUnlock(c);
         LOGV("waveout: format %u Hz %u ch %u bit", f.Rate, f.Channels, f.Bits);
@@ -758,6 +779,7 @@ NTSTATUS WaveOutWrite(CARD *c, PIRP irp, PIO_STACK_LOCATION sp)
     if (!len) return STATUS_SUCCESS;
     if (!va) return STATUS_INSUFFICIENT_RESOURCES;
     EngineLock(c);
+    if (c->Stopping) { EngineUnlock(c); return STATUS_DELETE_PENDING; }
     s = PlayFind(c, sp->FileObject);
     if (!s) { EngineUnlock(c); return STATUS_INVALID_DEVICE_REQUEST; }
     IRP_VA(irp) = va;
@@ -827,7 +849,7 @@ NTSTATUS WaveInIoctl(CARD *c, PIRP irp, PIO_STACK_LOCATION sp)
         } else {
             RecFlush(c, s);
         }
-        ConvSetup(&s->Conv, &f, TRUE);
+        ConvSetupRate(&s->Conv, &f, TRUE, c->EngineRate);
         s->BytesRecorded = 0; s->CurOffset = 0;
         EngineUnlock(c);
         return STATUS_SUCCESS;

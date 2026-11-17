@@ -428,6 +428,25 @@ static HANDLE ctl(void)
     return h;
 }
 
+/* A failed START_DEVICE creates no AudioNT0 control device. Preserve access
+   to the start snapshot even when Device Manager reports Code 10. */
+static void cmd_startlog(void)
+{
+    static char buf[16384];
+    HKEY key;
+    DWORD type, n = sizeof(buf), status = 0, ns = sizeof(status);
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\audiont\\Parameters",
+                      0, KEY_READ, &key) != ERROR_SUCCESS) {
+        u_printf("No saved Geode start log.\r\n"); g_fail++; return;
+    }
+    if (RegQueryValueExW(key, L"GeodeLastStartStatus", 0, &type, (BYTE *)&status, &ns) == ERROR_SUCCESS)
+        u_printf("Saved Geode START_DEVICE status: %x (snapshot, not live state)\r\n", (unsigned)status);
+    if (RegQueryValueExW(key, L"GeodeLastStartLog", 0, &type, (BYTE *)buf, &n) == ERROR_SUCCESS && type == REG_BINARY)
+        u_out(buf, n);
+    else { u_printf("No saved Geode start log.\r\n"); g_fail++; }
+    RegCloseKey(key);
+}
+
 static void cmd_log(void)
 {
     static char buf[32768]; DWORD got = 0; HANDLE h = ctl();
@@ -783,6 +802,7 @@ int main(void)
     else if (!u_wcsicmp(c, L"midi")) cmd_midi(argc > 2 ? u_watoi(argv[2]) : 0);
     else if (!u_wcsicmp(c, L"log")) cmd_log();
     else if (!u_wcsicmp(c, L"dump")) cmd_dump();
+    else if (!u_wcsicmp(c, L"startlog")) cmd_startlog();
     else if (!u_wcsicmp(c, L"stats")) cmd_stats();
     else if (!u_wcsicmp(c, L"lines")) cmd_lines();
     else if (!u_wcsicmp(c, L"sleep") && argc >= 3) Sleep(u_watoi(argv[2]));

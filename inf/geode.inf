@@ -1,0 +1,71 @@
+; Experimental Geode playback, XP / XPe SP3 x86. No class-wide PCI matches.
+[Version]
+Signature="$Windows NT$"
+Class=MEDIA
+ClassGUID={4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider=%Provider%
+DriverVer=11/17/2026,1.2.0.3
+
+[Manufacturer]
+%Provider%=AUDIONT,NTamd64
+
+[AUDIONT]
+%CS5530%=Geode,*CRX0002
+%CS5530%=Geode,ACPI\CRX0002
+%CS5530%=Geode,ISAPNP\CRX0002
+%Companion%=Companion,PCI\VEN_1078&DEV_0103
+%CS5536%=Geode,PCI\VEN_1022&DEV_2093
+
+[AUDIONT.NTamd64]
+; Deliberately empty: these backends target XP x86 only.
+
+[SourceDisksNames.x86]
+1=%Disk%,,,\i386
+[SourceDisksFiles]
+audiont.sys=1
+audiont.dll=1
+[DestinationDirs]
+DriverFiles=12
+WinMMFiles=11
+
+[Geode.NT]
+CopyFiles=DriverFiles,WinMMFiles
+[Geode.NT.Services]
+AddService=audiont,0x00000002,Service
+
+; PCI resource companion only. The CRX0002 node owns ISA IRQ/DMA resources.
+; No LogConfigOverride, VSA replacement or native PCI audio service here.
+[Companion.NT]
+[Companion.NT.Services]
+AddService=,0x00000002
+
+[Service]
+DisplayName=%ServiceName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\audiont.sys
+LoadOrderGroup=Extended Base
+AddReg=Parameters
+
+[Parameters]
+HKR,Parameters,StandardNames,0x00010001,0
+HKR,Parameters,InterruptMode,0x00010001,1
+HKR,Parameters,LatencyMs,0x00010001,100
+HKR,Parameters,RelocateBars,0x00010001,0
+HKR,Parameters,UsbAudio,0x00010001,0
+HKR,Parameters,DebugLevel,0x00010001,2
+HKR,Parameters,DebugPorts,0x00010001,4
+
+[DriverFiles]
+audiont.sys
+[WinMMFiles]
+audiont.dll
+
+[Strings]
+Provider="AUDIONT"
+Disk="AUDIONT experimental Geode XP x86"
+ServiceName="AUDIONT Geode playback (experimental)"
+CS5530="Geode CS5530 VSA1 playback (AUDIONT experimental)"
+Companion="Geode CS5530 PCI companion (audio via CRX0002)"
+CS5536="Geode CS5536 AC97 playback (AUDIONT experimental)"

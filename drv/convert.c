@@ -268,10 +268,16 @@ void RsToRing(RESAMPLER *rs, const LONG *in, ULONG frames, SHORT *ring, ULONG ri
 /* ------------------------------------------------------------------ */
 BOOLEAN ConvSetup(CONVERTER *cv, const PCM_FORMAT *f, BOOLEAN record)
 {
+    return ConvSetupRate(cv, f, record, ENG_RATE);
+}
+
+BOOLEAN ConvSetupRate(CONVERTER *cv, const PCM_FORMAT *f, BOOLEAN record, ULONG rate)
+{
+    if (!rate || !f->Rate) return FALSE;
     cv->Fmt = *f;
     MixMatrix(cv);
-    if (record) RsInit(&cv->Rs, ENG_RATE, f->Rate);
-    else        RsInit(&cv->Rs, f->Rate, ENG_RATE);
+    if (record) RsInit(&cv->Rs, rate, f->Rate);
+    else        RsInit(&cv->Rs, f->Rate, rate);
     cv->CarryLen = 0;
     cv->PendLen = cv->PendOff = 0;
     return TRUE;

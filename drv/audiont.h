@@ -27,7 +27,7 @@
 #define MAX_PLAY_STREAMS      8
 #define MAX_REC_STREAMS       4
 
-/* engine format: fixed */
+/* engine format: fixed S16 stereo; default rate, overridden by CS5530 */
 #define ENG_RATE              48000
 #define ENG_CH                2
 #define ENG_FRAME_BYTES       4
@@ -154,7 +154,7 @@ typedef struct _HWOPS {
 } HWOPS;
 
 typedef enum { HW_AC97_ICH = 1, HW_AC97_SIS, HW_AC97_NV, HW_AC97_ALI, HW_AC97_VIA,
-               HW_HDA, HW_USB, HW_LPE } HWTYPE;
+               HW_HDA, HW_USB, HW_LPE, HW_CS5530, HW_CS5536 } HWTYPE;
 
 /* device kinds created per card */
 enum { DEV_WAVEOUT = 0, DEV_WAVEIN, DEV_MIDIOUT, DEV_AUX, DEV_CTRL, DEV_KINDS };
@@ -164,6 +164,10 @@ typedef struct _DEV_EXT {
     struct _CARD *Card;
     ULONG Kind;
     ULONG Index;            /* number in device name */
+#ifdef AUDIONT_WDM
+    BOOLEAN GeodeRundown;
+    IO_REMOVE_LOCK RemoveLock;
+#endif
 } DEV_EXT;
 #define DEVEXT_MAGIC 0x41554E54
 
@@ -203,6 +207,13 @@ typedef struct _CARD {
     ULONG   MmioSize;
     DMA_BUFFER PlayRing, RecRing, Aux;   /* Aux: BDLs, CORB/RIRB, position buffer */
     BOOLEAN CanRecord;
+    ULONG EngineRate;          /* zero before EngineInit means the default 48 kHz */
+    BOOLEAN NoSynth;           /* playback-only backends do not advertise MIDI */
+    BOOLEAN RequireInterrupt;
+    BOOLEAN BackendBuffers;    /* backend owns PlayRing/RecRing allocation */
+    BOOLEAN EngineReady;
+    volatile BOOLEAN Removing;
+    PVOID Geode;               /* private Geode backend state */
     /* interrupts / timing */
     PKINTERRUPT Interrupt;
     KSPIN_LOCK  IntLock;
@@ -294,6 +305,7 @@ void     IrpFinish(CARD *c, PIRP irp, NTSTATUS st, ULONG info); /* lock held */
 
 /* convert.c */
 BOOLEAN  ConvValidFormat(const WAVEFORMATEX *wf, ULONG len, PCM_FORMAT *out);
+BOOLEAN ConvSetupRate(CONVERTER *cv, const PCM_FORMAT *f, BOOLEAN record, ULONG rate);
 BOOLEAN  ConvSetup(CONVERTER *cv, const PCM_FORMAT *f, BOOLEAN record);  /* PASSIVE: may allocate */
 void     ConvReset(CONVERTER *cv);
 void     ConvFree(CONVERTER *cv);

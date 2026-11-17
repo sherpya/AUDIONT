@@ -2,6 +2,7 @@
  * AUDIONT - driver entry, PCI discovery, device objects and IRP dispatch
  */
 #include "audiont.h"
+#include "geode.h"
 
 CARD *g_Cards[MAX_CARDS];
 ULONG g_CardCount;
@@ -50,6 +51,10 @@ static NTSTATUS CreateDev(CARD *c, ULONG kind)
     {
         DEV_EXT *ext = dev->DeviceExtension;
         ext->Magic = DEVEXT_MAGIC; ext->Card = c; ext->Kind = kind; ext->Index = n;
+#ifdef AUDIONT_WDM
+        ext->GeodeRundown = c->Type == HW_CS5530 || c->Type == HW_CS5536;
+        if (ext->GeodeRundown) IoInitializeRemoveLock(&ext->RemoveLock, 0x67647541, 0, 0);
+#endif
     }
     dev->Flags |= DO_DIRECT_IO;
     dev->Flags &= ~DO_DEVICE_INITIALIZING;
@@ -72,6 +77,15 @@ static void DeleteDevs(CARD *c)
             MakeName(link, "\\DosDevices\\", KINDNAME(k), c->DevIndex[k]);
             RtlInitUnicodeString(&ls, link);
             IoDeleteSymbolicLink(&ls);
+#ifdef AUDIONT_WDM
+            {
+                DEV_EXT *ext = c->Devs[k]->DeviceExtension;
+                if (ext->GeodeRundown) {
+                    IoAcquireRemoveLock(&ext->RemoveLock, c);
+                    IoReleaseRemoveLockAndWait(&ext->RemoveLock, c);
+                }
+            }
+#endif
             if (k == DEV_CTRL) IoUnregisterShutdownNotification(c->Devs[k]);
             /* a handle still open on it (the mixer) must not reach the freed card */
             ((DEV_EXT *)c->Devs[k]->DeviceExtension)->Magic = 0;
@@ -88,13 +102,38 @@ NTSTATUS NTAPI AudiontDispatch(PDEVICE_OBJECT dev, PIRP irp)
 {
     DEV_EXT *ext = dev->DeviceExtension;
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
-    CARD *c = ext->Card;
+    CARD *c;
     NTSTATUS st = STATUS_SUCCESS;
 
     irp->IoStatus.Information = 0;
+#ifdef AUDIONT_WDM
+    if (ext->GeodeRundown) {
+        st = IoAcquireRemoveLock(&ext->RemoveLock, irp);
+        if (!NT_SUCCESS(st)) {
+            irp->IoStatus.Status = st;
+            IoCompleteRequest(irp, IO_NO_INCREMENT); /* no lock was acquired */
+            return st;
+        }
+        st = IoAcquireRemoveLock(&ext->RemoveLock, sp); /* dispatch can outlive inline IRP completion */
+        if (!NT_SUCCESS(st)) {
+            IoReleaseRemoveLock(&ext->RemoveLock, irp);
+            irp->IoStatus.Status = st;
+            IoCompleteRequest(irp, IO_NO_INCREMENT);
+            return st;
+        }
+    }
+#endif
+    c = ext->Card;
     if (ext->Magic != DEVEXT_MAGIC) {
         OsCompleteIrp(irp, STATUS_INVALID_DEVICE_REQUEST, 0);
         return STATUS_INVALID_DEVICE_REQUEST;
+    }
+    if (c->Removing) {
+        OsCompleteIrp(irp, STATUS_DELETE_PENDING, 0);
+#ifdef AUDIONT_WDM
+        if (ext->GeodeRundown) IoReleaseRemoveLock(&ext->RemoveLock, sp);
+#endif
+        return STATUS_DELETE_PENDING;
     }
     switch (sp->MajorFunction) {
     case IRP_MJ_CREATE:
@@ -151,6 +190,9 @@ NTSTATUS NTAPI AudiontDispatch(PDEVICE_OBJECT dev, PIRP irp)
         st = STATUS_INVALID_DEVICE_REQUEST;
     }
     if (st != STATUS_PENDING) OsCompleteIrp(irp, st, irp->IoStatus.Information);
+#ifdef AUDIONT_WDM
+    if (ext->GeodeRundown) IoReleaseRemoveLock(&ext->RemoveLock, sp);
+#endif
     return st;
 }
 
@@ -278,6 +320,11 @@ static void FreeCard(CARD *c)
     DeleteDevs(c);
     if (c->Type == HW_USB) UsbAudFreeCard(c);
     SynthDestroy(c);
+    {
+        ULONG i;
+        for (i = 0; i < MAX_PLAY_STREAMS; i++) ConvFree(&c->Play[i].Conv);
+        for (i = 0; i < MAX_REC_STREAMS; i++) ConvFree(&c->Rec[i].Conv);
+    }
     OsFreeDma(&c->PlayRing);
     OsFreeDma(&c->RecRing);
     OsFreeDma(&c->Aux);
@@ -380,6 +427,14 @@ static void PciPrepare(CARD *c)
 /* tears a card down completely (its devices disappear) */
 void CardDestroy(CARD *c)
 {
+    if (c->Type == HW_CS5530 || c->Type == HW_CS5536) {
+        EngineLock(c);
+        c->Removing = TRUE;
+        c->Stopping = TRUE;
+        EngineUnlock(c);
+        EngineStopAll(c);
+        DeleteDevs(c); /* drain dispatched and queued IRPs before touching backend state */
+    }
     EngineStopAll(c);
     EngineShutdown(c);
     if (c->Ops->Shutdown) c->Ops->Shutdown(c);
@@ -394,9 +449,14 @@ static CARD *CardFinish(CARD *c, ULONG slot)
     for (k = 0; k < LINE_COUNT; k++)
         if (c->Lines[k].Present && c->Lines[k].HwVolume && c->Ops->ApplyLine) c->Ops->ApplyLine(c, k);
     if (c->Ops->ApplyRecSrc && c->RecSrc) c->Ops->ApplyRecSrc(c);
-    SynthCreate(c);
+    if (!c->NoSynth) SynthCreate(c);
+    if (!NT_SUCCESS(EngineStart(c))) {
+        EngineShutdown(c);
+        if (c->Ops->Shutdown) c->Ops->Shutdown(c);
+        FreeCard(c);
+        return NULL;
+    }
     CardCreateDevs(c);
-    EngineStart(c);
     g_Cards[slot] = c;
     if (slot >= g_CardCount) g_CardCount = slot + 1;
     LOGI("card%u ready: codec \"%s\", waveout%u%s, midiout%u", c->Index, c->Codec,
@@ -421,7 +481,7 @@ CARD *CardProbe(ULONG bus, ULONG dev, ULONG fn, const CARD_INT *Int)
     c->Index = slot;
     c->Bus = bus; c->Dev = dev; c->Fn = fn;
     ReadPci(c);
-    if (!LpeProbe(c) && !HdaProbe(c) && !Ac97Probe(c)) {
+    if (!Cs5536Probe(c) && !LpeProbe(c) && !HdaProbe(c) && !Ac97Probe(c)) {
         LOGI("pci %u:%u.%u %04x:%04x class %06x: not a supported sound controller", bus, dev, fn, c->VendorId,
              c->DeviceId, PciRead32(bus, dev, fn, 8) >> 8);
         OsFree(c);
@@ -445,6 +505,7 @@ CARD *CardProbe(ULONG bus, ULONG dev, ULONG fn, const CARD_INT *Int)
         LOGE("card%u: initialisation failed (%x)", c->Index, st);
         /* stop whatever DMA the back-end started before its buffers are freed, and give
            the function back as it was (e.g. the HDMI-only controller of a graphics card) */
+        EngineShutdown(c);
         if (c->Ops->Shutdown) c->Ops->Shutdown(c);
         PciWrite16(bus, dev, fn, 0x04, cmdOrig);
         FreeCard(c);
@@ -452,6 +513,37 @@ CARD *CardProbe(ULONG bus, ULONG dev, ULONG fn, const CARD_INT *Int)
     }
     return CardFinish(c, slot);
 }
+
+#ifdef AUDIONT_WDM
+NTSTATUS CardProbeCs5530(PDEVICE_OBJECT pdo, PDEVICE_OBJECT fdo, const GEODE_RES *r, CARD **out)
+{
+    CARD *c;
+    NTSTATUS st;
+    ULONG slot;
+    *out = NULL;
+    for (slot = 0; slot < MAX_CARDS && g_Cards[slot]; slot++) ;
+    if (slot == MAX_CARDS) return STATUS_INSUFFICIENT_RESOURCES;
+    c = OsAlloc(sizeof(*c));
+    if (!c) return STATUS_INSUFFICIENT_RESOURCES;
+    c->Index = slot; c->Bus = c->Dev = c->Fn = 0xff;
+    c->VendorId = 0x1078; c->DeviceId = 0x0103;
+    st = Cs5530Attach(c, pdo, fdo, r);
+    if (NT_SUCCESS(st)) {
+        CtrlInit(c);
+        st = EngineInit(c);
+        if (NT_SUCCESS(st)) st = c->Ops->Init(c);
+    }
+    if (!NT_SUCCESS(st)) {
+        LOGE("cs5530: start failed (%08x)", st);
+        EngineShutdown(c);
+        if (c->Ops && c->Ops->Shutdown) c->Ops->Shutdown(c);
+        FreeCard(c);
+        return st;
+    }
+    *out = CardFinish(c, slot);
+    return *out ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+#endif
 
 /* an audio DSP that only ACPI describes (Bay Trail / Cherry Trail / Broadwell in ACPI mode) */
 CARD *CardProbeAcpi(USHORT devId, ULONG mem0, ULONG mem1, BOOLEAN flag)
@@ -475,6 +567,7 @@ CARD *CardProbeAcpi(USHORT devId, ULONG mem0, ULONG mem1, BOOLEAN flag)
     if (NT_SUCCESS(st)) st = c->Ops->Init(c);
     if (!NT_SUCCESS(st)) {
         LOGE("card%u: initialisation failed (%x)", c->Index, st);
+        EngineShutdown(c);
         if (c->Ops->Shutdown) c->Ops->Shutdown(c);
         FreeCard(c);
         return NULL;

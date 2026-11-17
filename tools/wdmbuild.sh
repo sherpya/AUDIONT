@@ -18,7 +18,7 @@ mkdir -p "$OUT"
 OUT=$(realpath "$OUT")
 case "$OUT" in *[[:space:]]*) echo "Output path must not contain whitespace" >&2; exit 2 ;; esac
 export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git show -s --format=%ct HEAD)}
-SRC="ac97 ac97codec convert ctrl engine hda main os synth usbaud via wdm acpi sst sstipc4 sstipc3 sstcodec sdw sdw_sdca sdw_rt711 sdw_rt1316 sdw_rtcom sdw_rt712 sdw_rt722 sdw_rt715 sdw_rt700 sdw_rt5682 sdw_rt1318 sdw_rt1320 sdw_rt1308 sdw_max98373 sdw_cs35l56 sdw_cs42l43 i2c gpio spi sideamp lpe $(cd drv && ls cod_*.c | sed 's/\.c$//' | tr '\n' ' ')"
+SRC="cs5530 cs5536 geode_res ac97 ac97codec convert ctrl engine hda main os synth usbaud via wdm acpi sst sstipc4 sstipc3 sstcodec sdw sdw_sdca sdw_rt711 sdw_rt1316 sdw_rtcom sdw_rt712 sdw_rt722 sdw_rt715 sdw_rt700 sdw_rt5682 sdw_rt1318 sdw_rt1320 sdw_rt1308 sdw_max98373 sdw_cs35l56 sdw_cs42l43 i2c gpio spi sideamp lpe $(cd drv && ls cod_*.c | sed 's/\.c$//' | tr '\n' ' ')"
 COMMON="-c -O2 -std=gnu99 -Wall -Wno-unused-function -Wno-unused-parameter -fno-builtin -ffreestanding \
  -fno-stack-protector -mno-stack-arg-probe -mgeneral-regs-only -fno-strict-aliasing -fno-common -DAUDIONT_WDM=1 \
  -D_WIN32_WINNT=0x0500 -DNTDDI_VERSION=0x05000000 -I/usr/share/mingw-w64/include/ddk -Iinc -Idrv -Werror=implicit-function-declaration -Werror=int-to-pointer-cast \

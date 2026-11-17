@@ -126,6 +126,8 @@ static const AC97_ID g_Ac97Ids[] = {
 BOOLEAN Ac97Probe(CARD *c)
 {
     ULONG i, cls = PciRead32(c->Bus, c->Dev, c->Fn, 8) >> 8;
+    if ((c->VendorId == 0x1078 && c->DeviceId == 0x0103) ||
+        (c->VendorId == 0x1022 && c->DeviceId == 0x2093)) return FALSE;
     for (i = 0; g_Ac97Ids[i].Ven; i++) {
         if (g_Ac97Ids[i].Ven == c->VendorId && g_Ac97Ids[i].Dev == c->DeviceId) {
             c->Type = g_Ac97Ids[i].Type;

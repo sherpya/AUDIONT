@@ -10,10 +10,12 @@
  * (\Device\AudntWaveOut0 ...) that audiont.dll, the WinMM driver, opens.
  */
 #include "audiont.h"
+#include "geode.h"
 
 #define FDO_MAGIC   0x4D445741          /* 'AWDM' */
 #define FDO_PCI     1
 #define FDO_USB     2
+#define FDO_CRX     3
 
 typedef struct _FDO_EXT {
     ULONG           Magic;              /* first, like DEV_EXT.Magic */
@@ -23,6 +25,9 @@ typedef struct _FDO_EXT {
     PDEVICE_OBJECT  Pdo;
     ULONG           Bus, Dev, Fn;
     CARD_INT        Int;
+    GEODE_RES       GeodeRes;
+    BOOLEAN         Geode;
+    IO_REMOVE_LOCK  WorkLock;
     CARD           *Card;
     BOOLEAN         Started;
     BOOLEAN         Sleeping;
@@ -154,9 +159,13 @@ static void SetFriendlyName(PDEVICE_OBJECT pdo, const char *name)
     ZwClose(inst);
 }
 
-static void CardUp(FDO_EXT *x)
+static NTSTATUS CardUp(FDO_EXT *x)
 {
-    x->Card = CardProbe(x->Bus, x->Dev, x->Fn, x->Int.Valid ? &x->Int : NULL);
+    NTSTATUS st;
+    if (x->Kind == FDO_CRX) {
+        st = CardProbeCs5530(x->Pdo, x->Self, &x->GeodeRes, &x->Card);
+        if (!NT_SUCCESS(st)) return st;
+    } else x->Card = CardProbe(x->Bus, x->Dev, x->Fn, x->Int.Valid ? &x->Int : NULL);
     if (x->Card && OsRegGetDword(L"DeviceNames", 1)) {
         char name[96];
         CardDeviceName(x->Card, name, sizeof(name));
@@ -166,6 +175,7 @@ static void CardUp(FDO_EXT *x)
     if (!x->Card)
         LOGI("pnp: %u:%u.%u has no usable codec (HDMI only or not supported); device left idle",
              x->Bus, x->Dev, x->Fn);
+    return (!x->Card && x->Geode) ? STATUS_DEVICE_CONFIGURATION_ERROR : STATUS_SUCCESS;
 }
 
 static void CardDown(FDO_EXT *x)
@@ -198,16 +208,34 @@ static NTSTATUS FdoPnp(FDO_EXT *x, PIRP irp)
         if (NT_SUCCESS(st)) {
             if (x->Kind == FDO_USB) {
                 UsbUp();
+            } else if (x->Kind == FDO_CRX) {
+                st = GeodeResources(sp->Parameters.StartDevice.AllocatedResources,
+                                    sp->Parameters.StartDevice.AllocatedResourcesTranslated, &x->GeodeRes);
+                if (NT_SUCCESS(st)) st = CardUp(x);
             } else if (PciAddress(x->Pdo, &x->Bus, &x->Dev, &x->Fn)) {
                 FindInterrupt(sp->Parameters.StartDevice.AllocatedResourcesTranslated, &x->Int);
                 LOGI("pnp: %u:%u.%u started, interrupt %s vector %u irql %u %s", x->Bus, x->Dev, x->Fn,
                      x->Int.Valid ? "yes" : "none", x->Int.Vector, x->Int.Irql, x->Int.Shared ? "shared" : "");
-                CardUp(x);
+                if (x->Geode && !GeodePciResources(sp->Parameters.StartDevice.AllocatedResourcesTranslated,
+                                                   PciRead32(x->Bus, x->Dev, x->Fn, 0x10)))
+                    st = STATUS_DEVICE_CONFIGURATION_ERROR;
+                else st = CardUp(x);
             } else {
                 LOGE("pnp: no PCI address");
                 st = STATUS_NO_SUCH_DEVICE;
             }
             x->Started = NT_SUCCESS(st);
+        }
+        if (x->Geode) {
+            char *log;
+            LOGI("geode: START_DEVICE result %08x", st);
+            OsRegSetDword(L"GeodeLastStartStatus", (ULONG)st);
+            log = OsAlloc(16384);
+            if (log) {
+                ULONG n = OsLogSnapshot(log, 16384);
+                OsRegSetBinary(L"GeodeLastStartLog", log, n);
+                OsFree(log);
+            }
         }
         return Complete(irp, st);
     case IRP_MN_QUERY_STOP_DEVICE:
@@ -224,12 +252,17 @@ static NTSTATUS FdoPnp(FDO_EXT *x, PIRP irp)
         return PassDown(x, irp);
     case IRP_MN_STOP_DEVICE:
     case IRP_MN_SURPRISE_REMOVAL:
-        if (x->Kind == FDO_PCI) CardDown(x);
+        if (x->Kind != FDO_USB) CardDown(x);
         x->Started = FALSE;
         irp->IoStatus.Status = STATUS_SUCCESS;
         return PassDown(x, irp);
     case IRP_MN_REMOVE_DEVICE:
-        if (x->Kind == FDO_PCI) CardDown(x);
+        if (x->Geode) {
+            x->Started = FALSE;
+            IoAcquireRemoveLock(&x->WorkLock, irp);
+            IoReleaseRemoveLockAndWait(&x->WorkLock, irp);
+        }
+        if (x->Kind != FDO_USB) CardDown(x);
         else if (InterlockedDecrement(&g_UsbFdos) == 0) UsbDown();
         x->Started = FALSE;
         irp->IoStatus.Status = STATUS_SUCCESS;
@@ -252,6 +285,7 @@ static VOID NTAPI ResumeWork(PDEVICE_OBJECT dev, PVOID ctx)
         LOGI("pnp: %u:%u.%u back after sleep", x->Bus, x->Dev, x->Fn);
     }
     IoFreeWorkItem((PIO_WORKITEM)ctx);
+    if (x->Geode) IoReleaseRemoveLock(&x->WorkLock, ctx);
 }
 
 static NTSTATUS NTAPI PowerUpDone(PDEVICE_OBJECT dev, PIRP irp, PVOID ctx)
@@ -261,22 +295,41 @@ static NTSTATUS NTAPI PowerUpDone(PDEVICE_OBJECT dev, PIRP irp, PVOID ctx)
     if (irp->PendingReturned) IoMarkIrpPending(irp);
     if (x->Sleeping) {
         PIO_WORKITEM wi = IoAllocateWorkItem(dev);
-        if (wi) IoQueueWorkItem(wi, ResumeWork, DelayedWorkQueue, wi);
+        if (wi) {
+            if (!x->Geode || NT_SUCCESS(IoAcquireRemoveLock(&x->WorkLock, wi)))
+                IoQueueWorkItem(wi, ResumeWork, DelayedWorkQueue, wi);
+            else IoFreeWorkItem(wi);
+        }
     }
     PoStartNextPowerIrp(irp);
+    if (x->Geode) IoReleaseRemoveLock(&x->WorkLock, irp);
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS FdoPower(FDO_EXT *x, PIRP irp)
 {
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
-    if (x->Kind == FDO_PCI && x->Started && sp->MinorFunction == IRP_MN_SET_POWER &&
+    /* First Geode release deliberately vetoes sleep: streams cannot yet survive
+     * loss of VSA/codec state. A forced transition still stops DMA and rebuilds
+     * devices on return; applications must reopen their handles. */
+    if (x->Geode && sp->MinorFunction == IRP_MN_QUERY_POWER &&
+        sp->Parameters.Power.Type == SystemPowerState &&
+        sp->Parameters.Power.State.SystemState > PowerSystemWorking &&
+        sp->Parameters.Power.State.SystemState < PowerSystemShutdown) {
+        PoStartNextPowerIrp(irp);
+        return Complete(irp, STATUS_NOT_SUPPORTED);
+    }
+    if (x->Kind != FDO_USB && x->Started && sp->MinorFunction == IRP_MN_SET_POWER &&
         sp->Parameters.Power.Type == SystemPowerState) {
         SYSTEM_POWER_STATE s = sp->Parameters.Power.State.SystemState;
         if (s > PowerSystemWorking && s < PowerSystemShutdown && !x->Sleeping && x->Card) {
             x->Sleeping = TRUE;
             CardDown(x);                    /* the codec loses its state in S3 */
         } else if (s == PowerSystemWorking && x->Sleeping) {
+            if (x->Geode && !NT_SUCCESS(IoAcquireRemoveLock(&x->WorkLock, irp))) {
+                PoStartNextPowerIrp(irp);
+                return Complete(irp, STATUS_DELETE_PENDING);
+            }
             IoCopyCurrentIrpStackLocationToNext(irp);
             IoSetCompletionRoutine(irp, PowerUpDone, NULL, TRUE, TRUE, TRUE);
             return PoCallDriver(x->Lower, irp);
@@ -321,7 +374,7 @@ static NTSTATUS NTAPI AddDevice(PDRIVER_OBJECT drv, PDEVICE_OBJECT pdo)
 {
     PDEVICE_OBJECT fdo;
     FDO_EXT *x;
-    WCHAR hw[64];
+    WCHAR hw[512];
     ULONG len = 0, kind = FDO_PCI;
     NTSTATUS st;
 
@@ -329,12 +382,22 @@ static NTSTATUS NTAPI AddDevice(PDRIVER_OBJECT drv, PDEVICE_OBJECT pdo)
     IoGetDeviceProperty(pdo, DevicePropertyHardwareID, sizeof(hw) - sizeof(WCHAR), hw, &len);
     if (hw[0] == 'U' && hw[1] == 'S' && hw[2] == 'B' && hw[3] == 'N' && hw[4] == 'T' && hw[5] == '\\')
         kind = FDO_USB;                     /* USBNT\Audio: USB audio devices through USBNT */
+    if (GeodeHardwareId(hw, ARRAYSIZE(hw))) kind = FDO_CRX;
+    else if (kind != FDO_USB && !GeodePciId(hw, ARRAYSIZE(hw))) {
+        WCHAR compat[512];
+        memset(compat, 0, sizeof(compat));
+        if (NT_SUCCESS(IoGetDeviceProperty(pdo, DevicePropertyCompatibleIDs,
+                       sizeof(compat) - sizeof(WCHAR), compat, &len)) &&
+            GeodeHardwareId(compat, ARRAYSIZE(compat))) kind = FDO_CRX;
+    }
     st = IoCreateDevice(drv, sizeof(FDO_EXT), NULL, FILE_DEVICE_SOUND, FILE_DEVICE_SECURE_OPEN, FALSE, &fdo);
     if (!NT_SUCCESS(st)) return st;
     x = fdo->DeviceExtension;
     memset(x, 0, sizeof(*x));
     x->Magic = FDO_MAGIC;
     x->Kind = kind;
+    x->Geode = kind == FDO_CRX || GeodePciId(hw, ARRAYSIZE(hw));
+    if (x->Geode) IoInitializeRemoveLock(&x->WorkLock, 0x77647541, 0, 0);
     x->Self = fdo;
     x->Pdo = pdo;
     x->Lower = IoAttachDeviceToDeviceStack(fdo, pdo);
