@@ -34,7 +34,7 @@ RC      = i686-w64-mingw32-windres
 
 $(OUT)/uobj/%.res.o: tools/res/%.rc tools/res/%.ico
 	@mkdir -p $(OUT)/uobj
-	cd tools/res && $(RC) -O coff $*.rc -o ../../$@
+	cd tools/res && $(RC) -O coff $*.rc -o "$(abspath $@)"
 
 $(OUT)/uobj/%.o: user/%.c user/ucrt.h
 	@mkdir -p $(OUT)/uobj

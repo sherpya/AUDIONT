@@ -2,15 +2,29 @@
 # Builds AUDIONT for Windows 2000 / XP with MinGW-w64: build/2kxp/i386/audiont.sys and
 # build/2kxp/amd64/audiont.sys (Plug and Play), the WinMM driver audiont.dll and the tools
 # for both architectures.
-set -e
+set -euo pipefail
 cd "$(dirname "$0")/.."
+ARCHES="i386 amd64"
+OUT="build/2kxp"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --arch) ARCHES=${2:?missing architecture}; shift 2 ;;
+    --out) OUT=${2:?missing output directory}; shift 2 ;;
+    *) echo "Usage: $0 [--arch i386|amd64|all] [--out directory]" >&2; exit 2 ;;
+  esac
+done
+case "$ARCHES" in all) ARCHES="i386 amd64" ;; i386|amd64|"i386 amd64") ;; *) exit 2 ;; esac
+mkdir -p "$OUT"
+OUT=$(realpath "$OUT")
+case "$OUT" in *[[:space:]]*) echo "Output path must not contain whitespace" >&2; exit 2 ;; esac
+export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git show -s --format=%ct HEAD)}
 SRC="ac97 ac97codec convert ctrl engine hda main os synth usbaud via wdm acpi sst sstipc4 sstipc3 sstcodec sdw sdw_sdca sdw_rt711 sdw_rt1316 sdw_rtcom sdw_rt712 sdw_rt722 sdw_rt715 sdw_rt700 sdw_rt5682 sdw_rt1318 sdw_rt1320 sdw_rt1308 sdw_max98373 sdw_cs35l56 sdw_cs42l43 i2c gpio spi sideamp lpe $(cd drv && ls cod_*.c | sed 's/\.c$//' | tr '\n' ' ')"
 COMMON="-c -O2 -std=gnu99 -Wall -Wno-unused-function -Wno-unused-parameter -fno-builtin -ffreestanding \
  -fno-stack-protector -mno-stack-arg-probe -mgeneral-regs-only -fno-strict-aliasing -fno-common -DAUDIONT_WDM=1 \
- -I/usr/share/mingw-w64/include/ddk -Iinc -Idrv -Werror=implicit-function-declaration -Werror=int-to-pointer-cast \
+ -D_WIN32_WINNT=0x0500 -DNTDDI_VERSION=0x05000000 -I/usr/share/mingw-w64/include/ddk -Iinc -Idrv -Werror=implicit-function-declaration -Werror=int-to-pointer-cast \
  -Werror=pointer-to-int-cast"
-for arch in i386 amd64; do
-  O=build/2kxp/$arch; mkdir -p $O/obj
+for arch in $ARCHES; do
+  O="$OUT/$arch"; mkdir -p "$O/obj"
   if [ $arch = i386 ]; then
     CC=i686-w64-mingw32-gcc; CF="$COMMON -march=i586 -mtune=generic -fno-asynchronous-unwind-tables -D_X86_=1"
     ENTRY=_DriverEntry@8; OSV="5,--minor-subsystem-version,0"
@@ -19,24 +33,32 @@ for arch in i386 amd64; do
     ENTRY=DriverEntry; OSV="5,--minor-subsystem-version,2"
   fi
   OBJS=""
-  for f in $SRC; do $CC $CF drv/$f.c -o $O/obj/$f.o; OBJS="$OBJS $O/obj/$f.o"; done
-  $CC -nostdlib -o $O/audiont.sys $OBJS -Wl,--subsystem,native -Wl,--image-base,0x10000 -Wl,--entry,$ENTRY \
+  for f in $SRC; do $CC $CF drv/$f.c -o "$O/obj/$f.o"; OBJS="$OBJS $O/obj/$f.o"; done
+  $CC -nostdlib -o "$O/audiont.sys" $OBJS -Wl,--subsystem,native -Wl,--image-base,0x10000 -Wl,--entry,$ENTRY \
     -Wl,--file-alignment,0x200 -Wl,--section-alignment,0x1000 -Wl,--enable-reloc-section \
-    -Wl,--major-subsystem-version,$OSV -Wl,--no-insert-timestamp -Wl,-s -lntoskrnl -lhal -lgcc
-  python3 tools/fixpe5.py $O/audiont.sys $arch
+    -Wl,--major-subsystem-version,$OSV -Wl,--no-insert-timestamp -Wl,-Map,"$O/audiont.map" -lntoskrnl -lhal -lgcc
+  "$CC" -print-libgcc-file-name > "$O/compiler-runtime.txt"
+  ${CC%gcc}objcopy --only-keep-debug "$O/audiont.sys" "$O/obj/audiont.symbols"
+  ${CC%gcc}strip --strip-unneeded "$O/audiont.sys"
+  python3 tools/fixpe5.py "$O/audiont.sys" "$arch"
+  if [ "$arch" = i386 ]; then
+    make tools OUT="$O"
+    cp "$O/attest.exe" "$O/audtest.exe"
+  fi
 done
+case " $ARCHES " in *" amd64 "*) ;; *) exit 0 ;; esac
 # the 64 bit WinMM driver and tools (2kxp/amd64); the 32 bit ones (build/*.dll, *.exe) serve
 # Windows 2000 / XP x86 and the 32 bit programs on x64
-O=build/2kxp/amd64; CC=x86_64-w64-mingw32-gcc
+O="$OUT/amd64"; CC=x86_64-w64-mingw32-gcc
 UCF="-O2 -fno-stack-protector -fno-asynchronous-unwind-tables -fno-builtin -Wall -Wno-unused-function -Iuser -Iinc"
 ULF="-nostdlib -Wl,--file-alignment,0x200 -Wl,--section-alignment,0x1000 -Wl,--enable-reloc-section -s \
  -Wl,--major-subsystem-version,5,--minor-subsystem-version,2 -Wl,--major-os-version,5,--minor-os-version,2"
 ULIBS="-luser32 -lkernel32 -ladvapi32 -lgdi32 -lwinmm -lcomdlg32 -lshell32 -lgcc"
 mkdir -p $O/uobj
 for f in audrv setup pnp5 audmix attest ucrt; do $CC $UCF -c user/$f.c -o $O/uobj/$f.o; done
-for r in setup audmix audtest; do (cd tools/res && x86_64-w64-mingw32-windres -O coff $r.rc -o ../../$O/uobj/$r.res.o); done
+for r in setup audmix audtest; do (cd tools/res && x86_64-w64-mingw32-windres -O coff $r.rc -o "$O/uobj/$r.res.o"); done
 $CC $ULF -shared -Wl,-e,DllMain -o $O/audiont.dll $O/uobj/audrv.o $O/uobj/ucrt.o user/audrv64.def $ULIBS
 $CC $ULF -mconsole -Wl,-e,WinMainCRTStartup -o $O/setup.exe $O/uobj/setup.o $O/uobj/pnp5.o $O/uobj/ucrt.o $O/uobj/setup.res.o $ULIBS
 $CC $ULF -mwindows -Wl,-e,WinMainCRTStartup -o $O/audmix.exe $O/uobj/audmix.o $O/uobj/ucrt.o $O/uobj/audmix.res.o $ULIBS
 $CC $ULF -mconsole -Wl,-e,WinMainCRTStartup -o $O/audtest.exe $O/uobj/attest.o $O/uobj/ucrt.o $O/uobj/audtest.res.o $ULIBS
-ls -la build/2kxp/*/*.sys $O/*.dll $O/*.exe
+ls -la "$OUT"/*/*.sys "$O"/*.dll "$O"/*.exe

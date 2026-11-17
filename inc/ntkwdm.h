@@ -6,6 +6,11 @@
 #ifndef AUDIONT_NTKWDM_H
 #define AUDIONT_NTKWDM_H
 
+/* MinGW-w64 10 uses this alias in IO_STACK_LOCATION, but does not define it.
+ * Keep the workaround local; the public NTDDI_VISTA value is 0x06000000. */
+#ifndef NTDDI_WINVISTA
+#define NTDDI_WINVISTA 0x06000000
+#endif
 #include <ntddk.h>
 
 #define IRP_LE_FIELD Tail.Overlay.ListEntry

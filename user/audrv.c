@@ -13,6 +13,9 @@
  */
 #include "ucrt.h"
 #include <mmddk.h>
+#include <mmreg.h>
+/* Some MinGW versions omit this documented winmm driver entry point. */
+WINBOOL WINAPI DriverCallback(DWORD_PTR, DWORD, HDRVR, DWORD, DWORD_PTR, DWORD_PTR, DWORD_PTR);
 #include "audiontio.h"
 
 /* kernel interface (same codes as ntddwave.h etc.) */
